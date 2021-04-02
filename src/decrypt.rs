@@ -185,5 +185,6 @@ fn mux_video(
         progress_callback.on_progress(progress);
     }
     muxer.flush()?;
+    progress_callback.on_complete();
     Ok(())
 }
