@@ -8,7 +8,7 @@ use ac_ffmpeg::{
     packet::{Packet, PacketMut},
     time::Timestamp,
 };
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::{ByteOrder, LittleEndian};
 use log::{debug, warn};
 use serde::Deserialize;
@@ -77,7 +77,7 @@ enum PacketType {
 }
 
 pub trait DecryptingJob {
-    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>) -> Result<()>;
+    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>);
 }
 
 pub trait ProgressCallback {
@@ -104,7 +104,7 @@ struct VideoMuxingJob {
 unsafe impl Send for VideoMuxingJob {}
 
 impl DecryptingJob for VideoMuxingJob {
-    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>) -> Result<()> {
+    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>) {
         let bytes_before_data = self.params.bytes_before_data;
         let total_file_size = self.params.total_file_size;
         progress_callback.set_total_file_size(total_file_size);
@@ -123,35 +123,62 @@ fn mux_video(
     metadata: &VideoMetadata,
     out_path: &mut PathBuf,
     progress_callback: Box<&mut dyn ProgressCallback>,
-) -> Result<()> {
-    let video_params = VideoCodecParameters::builder("h264")?
+) {
+    let video_params = VideoCodecParameters::builder("h264")
+        .unwrap()
         .width(metadata.width)
         .height(metadata.height)
         .bit_rate(metadata.video_bitrate)
         .build();
     let channel_layout = match ChannelLayout::from_channels(metadata.audio_channel_count as u32) {
-        None => bail!("Error getting channel layout"),
+        None => {
+            progress_callback.on_error(anyhow!("Error getting channel layout").into());
+            return;
+        }
         Some(c) => c,
     };
-    let audio_params = AudioCodecParameters::builder("aac")?
+    let audio_params = AudioCodecParameters::builder("aac")
+        .unwrap()
         .channel_layout(channel_layout)
         .bit_rate(metadata.audio_bitrate)
         .sample_rate(metadata.audio_sample_rate)
         .build();
     let file_name = format!("{}.mp4", metadata.timestamp);
     let output_format = match OutputFormat::guess_from_file_name(&file_name) {
-        None => bail!("Could not find output format for filename {}", file_name),
+        None => {
+            progress_callback.on_error(
+                anyhow!("Could not find output format for filename {}", file_name).into(),
+            );
+            return;
+        }
         Some(o) => o,
     };
     out_path.push(file_name);
-    let out = File::create(&out_path)?;
+    let out = match File::create(&out_path) {
+        Err(e) => {
+            progress_callback.on_error(e.into());
+            return;
+        }
+        Ok(f) => f,
+    };
     let io = IO::from_seekable_write_stream(out);
     let mut muxer_builder = Muxer::builder().interleaved(true);
-    let video_stream_index = muxer_builder.add_stream(&CodecParameters::from(video_params))?;
-    let audio_stream_index = muxer_builder.add_stream(&CodecParameters::from(audio_params))?;
-    let mut muxer = muxer_builder
+    let video_stream_index = muxer_builder
+        .add_stream(&CodecParameters::from(video_params))
+        .unwrap();
+    let audio_stream_index = muxer_builder
+        .add_stream(&CodecParameters::from(audio_params))
+        .unwrap();
+    let mut muxer = match muxer_builder
         .set_stream_option(video_stream_index, "rotate", metadata.rotation)
-        .build(io, output_format)?;
+        .build(io, output_format)
+    {
+        Err(e) => {
+            progress_callback.on_error(e.into());
+            return;
+        }
+        Ok(m) => m,
+    };
 
     // packet header contains packet type (1B), pts in us (8B), length (4B)
     let mut packet_header: [u8; 13] = [0; 13];
@@ -169,7 +196,13 @@ fn mux_video(
         let pts = LittleEndian::read_u64(&packet_header[1..9]);
         let packet_length = LittleEndian::read_u32(&packet_header[9..13]) as usize;
         let mut packet_data = vec![0; packet_length];
-        data.read_exact(&mut packet_data)?;
+        match data.read_exact(&mut packet_data) {
+            Err(e) => {
+                progress_callback.on_error(e.into());
+                return;
+            }
+            Ok(()) => {}
+        };
         if first_pts.is_none() {
             first_pts = Some(pts as i64);
         }
@@ -180,11 +213,22 @@ fn mux_video(
                 PacketType::Audio => audio_stream_index as usize,
             })
             .freeze();
-        muxer.push(packet)?;
+        match muxer.push(packet) {
+            Err(e) => {
+                progress_callback.on_error(e.into());
+                return;
+            }
+            Ok(()) => {}
+        };
         progress += packet_header.len() as u64 + packet_length as u64;
         progress_callback.on_progress(progress);
     }
-    muxer.flush()?;
+    match muxer.flush() {
+        Err(e) => {
+            progress_callback.on_error(e.into());
+            return;
+        }
+        Ok(()) => {}
+    };
     progress_callback.on_complete();
-    Ok(())
 }
