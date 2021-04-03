@@ -12,7 +12,10 @@ use anyhow::{anyhow, bail, Result};
 use bytes::{ByteOrder, LittleEndian};
 use log::{debug, warn};
 use serde::Deserialize;
-use std::{error::Error, fs::File, io::BufReader, io::Read, path::PathBuf, str};
+use std::{
+    error::Error, fs::File, io::BufReader, io::Read, path::PathBuf, str, sync::atomic::AtomicBool,
+    sync::Arc,
+};
 
 #[derive(Debug, Deserialize)]
 struct VideoMetadata {
@@ -77,7 +80,7 @@ enum PacketType {
 }
 
 pub trait DecryptingJob {
-    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>);
+    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>, cancel: Arc<AtomicBool>);
 }
 
 pub trait ProgressCallback {
@@ -104,7 +107,7 @@ struct VideoMuxingJob {
 unsafe impl Send for VideoMuxingJob {}
 
 impl DecryptingJob for VideoMuxingJob {
-    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>) {
+    fn run(&mut self, progress_callback: Box<&mut dyn ProgressCallback>, cancel: Arc<AtomicBool>) {
         let bytes_before_data = self.params.bytes_before_data;
         let total_file_size = self.params.total_file_size;
         progress_callback.set_total_file_size(total_file_size);
@@ -114,6 +117,7 @@ impl DecryptingJob for VideoMuxingJob {
             &self.params.metadata,
             &mut self.params.out_path,
             progress_callback,
+            cancel,
         )
     }
 }
@@ -123,6 +127,7 @@ fn mux_video(
     metadata: &VideoMetadata,
     out_path: &mut PathBuf,
     progress_callback: Box<&mut dyn ProgressCallback>,
+    cancel: Arc<AtomicBool>,
 ) {
     let video_params = VideoCodecParameters::builder("h264")
         .unwrap()
@@ -185,6 +190,9 @@ fn mux_video(
     let mut first_pts: Option<i64> = None;
     let mut progress: u64 = 0;
     while let Ok(()) = data.read_exact(&mut packet_header) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let packet_type = match packet_header[0] {
             1 => PacketType::Video,
             2 => PacketType::Audio,
