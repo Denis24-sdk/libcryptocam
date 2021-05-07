@@ -49,10 +49,12 @@ impl DecryptingJob for ImageDecryptionJob {
         progress_callback.set_total_file_size(total_file_size);
         progress_callback.set_offset(bytes_before_data);
 
+        let metadata = &self.params.metadata;
         let filename = format!(
             "{}.{}",
-            self.params.metadata.timestamp, self.params.metadata.format
-        );
+            metadata.timestamp.replace(":", "-"),
+            metadata.format
+        ); // try not tripping up windows with scary filenames
         let out_path = &mut self.params.out_path;
         out_path.push(filename);
         let mut out = match File::create(&out_path) {

@@ -115,7 +115,7 @@ fn mux_video(
         .bit_rate(metadata.audio_bitrate)
         .sample_rate(metadata.audio_sample_rate)
         .build();
-    let file_name = format!("{}.mp4", metadata.timestamp);
+    let file_name = format!("{}.mp4", metadata.timestamp.replace(":", "-")); // try not tripping up windows with scary filenames
     let output_format = match OutputFormat::guess_from_file_name(&file_name) {
         None => {
             progress_callback.on_error(
