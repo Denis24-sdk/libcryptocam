@@ -111,7 +111,7 @@ fn mux_video(
     };
     let audio_params = AudioCodecParameters::builder("aac")
         .unwrap()
-        .channel_layout(channel_layout)
+        .channel_layout(&channel_layout)
         .bit_rate(metadata.audio_bitrate)
         .sample_rate(metadata.audio_sample_rate)
         .build();
@@ -141,10 +141,8 @@ fn mux_video(
     let audio_stream_index = muxer_builder
         .add_stream(&CodecParameters::from(audio_params))
         .unwrap();
-    let mut muxer = match muxer_builder
-        .set_stream_option(video_stream_index, "rotate", metadata.rotation)
-        .build(io, output_format)
-    {
+    muxer_builder.streams_mut()[video_stream_index].set_metadata("rotate", metadata.rotation);
+    let mut muxer = match muxer_builder.build(io, output_format) {
         Err(e) => {
             progress_callback.on_error(e.into());
             return;

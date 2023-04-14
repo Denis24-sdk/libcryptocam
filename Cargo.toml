@@ -17,8 +17,7 @@ rust-ini = "0.17.0"
 base64 = "0.13"
 sha2 = "0.9"
 
-# TODO update this when release with support for stream metadata is out
-ac-ffmpeg = { git = "https://github.com/angelcam/rust-ac-ffmpeg", rev = "7a7ff68a621a8b2e8810de88748b237180e0feaf"}
+ac-ffmpeg = "0.18.1"
 
 anyhow = "1.0"
 thiserror = "1.0"
