@@ -1,6 +1,9 @@
 use crate::decrypt::{DecryptingJob, ProgressCallback};
 use ac_ffmpeg::{
-    codec::{audio::ChannelLayout, AudioCodecParameters, CodecParameters, VideoCodecParameters},
+    codec::{
+        audio::ChannelLayout, bsf::BitstreamFilter, AudioCodecParameters, CodecParameters,
+        VideoCodecParameters,
+    },
     format::{
         io::IO,
         muxer::{Muxer, OutputFormat},
@@ -43,7 +46,6 @@ struct VideoMetadata {
     audio_channel_count: u32,
     audio_bitrate: u64,
     timestamp: String,
-    // #[serde(default)] означает, что если поля нет в JSON, оно будет None.
     #[serde(default)]
     codec: Option<String>,
 }
@@ -99,19 +101,11 @@ fn mux_video(
     progress_callback: Box<&mut dyn ProgressCallback>,
     cancel: Arc<AtomicBool>,
 ) {
-    // ЛОГИКА ВЫБОРА КОДЕКА
-
+    // 1. Определение кодека (HEVC или AVC)
     let codec_name = match metadata.codec.as_deref() {
-        // Если Android написал "hevc" или "h265" - используем HEVC
         Some(c) if c.eq_ignore_ascii_case("hevc") || c.eq_ignore_ascii_case("h265") => "hevc",
-
-        // Иначе по умолчанию используем H.264 (как было раньше)
         _ => "h264",
-
-        // _ => "hevc",
     };
-
-    println!("Using codec: {}", codec_name); // Для отладки
 
     let video_params = VideoCodecParameters::builder(codec_name)
         .unwrap()
@@ -127,12 +121,28 @@ fn mux_video(
         }
         Some(c) => c,
     };
+
     let audio_params = AudioCodecParameters::builder("aac")
         .unwrap()
         .channel_layout(&channel_layout)
         .bit_rate(metadata.audio_bitrate)
         .sample_rate(metadata.audio_sample_rate)
         .build();
+
+    // 2. Создаем фильтр для исправления аудио (FIX ДЛЯ WINDOWS)
+    let mut audio_bsf = match BitstreamFilter::from_name("aac_adtstoasc") {
+        Ok(bsf) => bsf,
+        Err(e) => {
+            progress_callback.on_error(anyhow!("Error creating audio filter: {}", e).into());
+            return;
+        }
+    };
+    // Фильтру нужно знать параметры входящего аудио
+    if let Err(e) = audio_bsf.set_parameters(CodecParameters::from(audio_params.clone())) {
+        progress_callback.on_error(anyhow!("Error setting audio filter params: {}", e).into());
+        return;
+    }
+
     let file_name = format!("{}.mp4", metadata.timestamp.replace(":", "-"));
     let output_format = match OutputFormat::guess_from_file_name(&file_name) {
         None => {
@@ -154,25 +164,27 @@ fn mux_video(
     let io = IO::from_seekable_write_stream(out);
     let mut muxer_builder = Muxer::builder().interleaved(true);
 
-    // Добавляем видео-поток
     let video_stream_index = match muxer_builder.add_stream(&CodecParameters::from(video_params)) {
-         Ok(idx) => idx,
-         Err(e) => {
+        Ok(i) => i,
+        Err(e) => {
              progress_callback.on_error(anyhow!("Error adding video stream: {}", e).into());
              return;
-         }
-    };
-
-    // Добавляем аудио-поток
-    let audio_stream_index = match muxer_builder.add_stream(&CodecParameters::from(audio_params)) {
-        Ok(idx) => idx,
-        Err(e) => {
-            progress_callback.on_error(anyhow!("Error adding audio stream: {}", e).into());
-            return;
         }
     };
 
-    muxer_builder.streams_mut()[video_stream_index].set_metadata("rotate", metadata.rotation);
+    let audio_stream_index = match muxer_builder.add_stream(&CodecParameters::from(audio_params)) {
+        Ok(i) => i,
+        Err(e) => {
+             progress_callback.on_error(anyhow!("Error adding audio stream: {}", e).into());
+             return;
+        }
+    };
+
+    // 3. Исправление поворота (FIX ДЛЯ ORIENTATION)
+    // Преобразуем число в строку явно
+    muxer_builder.streams_mut()[video_stream_index]
+        .set_metadata("rotate", &metadata.rotation.to_string());
+
     let mut muxer = match muxer_builder.build(io, output_format) {
         Err(e) => {
             progress_callback.on_error(e.into());
@@ -184,6 +196,7 @@ fn mux_video(
     let mut packet_header: [u8; 13] = [0; 13];
     let mut first_pts: Option<i64> = None;
     let mut progress: u64 = 0;
+
     while let Ok(()) = data.read_exact(&mut packet_header) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -209,23 +222,56 @@ fn mux_video(
         if first_pts.is_none() {
             first_pts = Some(pts as i64);
         }
-        let packet: Packet = PacketMut::from(packet_data)
+
+        let packet = PacketMut::from(packet_data)
             .with_pts(Timestamp::from_micros(pts as i64 - first_pts.unwrap()))
             .with_stream_index(match packet_type {
                 PacketType::Video => video_stream_index as usize,
                 PacketType::Audio => audio_stream_index as usize,
             })
             .freeze();
-        match muxer.push(packet) {
-            Err(e) => {
-                progress_callback.on_error(e.into());
-                return;
+
+        // 4. Обработка пакетов с учетом фильтра для Аудио
+        match packet_type {
+            PacketType::Audio => {
+                // Прогоняем аудио через фильтр aac_adtstoasc
+                if let Err(e) = audio_bsf.push(packet) {
+                     progress_callback.on_error(anyhow!("Error pushing to audio filter: {}", e).into());
+                     return;
+                }
+                // Забираем отфильтрованные пакеты (их может быть несколько или 0)
+                while let Ok(Some(filtered_packet)) = audio_bsf.take() {
+                    if let Err(e) = muxer.push(filtered_packet) {
+                        progress_callback.on_error(e.into());
+                        return;
+                    }
+                }
+            },
+            PacketType::Video => {
+                // Видео пишем как есть
+                if let Err(e) = muxer.push(packet) {
+                    progress_callback.on_error(e.into());
+                    return;
+                }
             }
-            Ok(()) => {}
-        };
+        }
+
         progress += packet_header.len() as u64 + packet_length as u64;
         progress_callback.on_progress(progress);
     }
+
+    // Сбрасываем остатки фильтра
+    if let Err(e) = audio_bsf.flush() {
+         progress_callback.on_error(anyhow!("Error flushing audio filter: {}", e).into());
+         return;
+    }
+    while let Ok(Some(filtered_packet)) = audio_bsf.take() {
+        if let Err(e) = muxer.push(filtered_packet) {
+            progress_callback.on_error(e.into());
+            return;
+        }
+    }
+
     match muxer.flush() {
         Err(e) => {
             progress_callback.on_error(e.into());
